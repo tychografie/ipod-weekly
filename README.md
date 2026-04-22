@@ -70,6 +70,27 @@ Smart-mode state lives at `~/.ipod-weekly-state.json` (per-playlist snapshot
 hash). Smart-mode filenames are prefixed with the playlist tag (`dw_*.mp3`,
 `rr_*.mp3`) so a selective re-sync only touches that playlist's files.
 
+## Menubar app (auto-sync on connect)
+
+`ipod_watcher.py` is a tiny Python menubar app (built on `rumps` →
+`NSStatusItem`). It polls `/Volumes/` for a Shuffle mount and, when one
+appears, runs the smart sync in the background. Status, notifications, and
+a "Sync now" menu item live in the menubar.
+
+Install it as a LaunchAgent so it starts on login:
+
+```bash
+./install_watcher.sh
+```
+
+The script writes `~/Library/LaunchAgents/nl.tycholitjens.ipod-weekly.plist`
+and loads it. Output goes to `.watcher.log`. Uninstall with:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/nl.tycholitjens.ipod-weekly.plist
+rm ~/Library/LaunchAgents/nl.tycholitjens.ipod-weekly.plist
+```
+
 When it's done, eject:
 
 ```bash

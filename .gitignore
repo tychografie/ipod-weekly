@@ -9,3 +9,6 @@ IPod-Shuffle-4g/
 
 # Temp dir where yt-dlp drops MP3s before they're copied to the iPod.
 discover-weekly-tmp/
+
+# Watcher log (LaunchAgent stdout/stderr).
+.watcher.log
