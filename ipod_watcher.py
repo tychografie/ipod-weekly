@@ -72,6 +72,26 @@ class Watcher(rumps.App):
         self._refresh_status()
         log("watcher started")
 
+        # Hide the menubar item on launch -- it should only appear while an
+        # iPod is mounted (or a sync is in flight). The NSStatusItem isn't
+        # created until rumps finishes launching the NSApplication, so we
+        # defer to a one-shot timer that fires shortly after the event loop
+        # is up.
+        self._init_timer = rumps.Timer(self._initial_setup, 0.15)
+        self._init_timer.start()
+
+    def _initial_setup(self, timer) -> None:
+        timer.stop()
+        self._set_visible(False)
+        # Immediate first poll so plugged-in iPods don't wait for the 3s tick.
+        self._poll(None)
+
+    def _set_visible(self, visible: bool) -> None:
+        try:
+            self._nsapp.nsstatusitem.setVisible_(bool(visible))
+        except Exception as e:
+            log(f"setVisible({visible}) failed: {e!r}")
+
     def _refresh_status(self) -> None:
         if self.syncing:
             self.status_item.title = "Syncing…"
@@ -83,12 +103,14 @@ class Watcher(rumps.App):
     @rumps.timer(POLL_INTERVAL)
     def _poll(self, _sender) -> None:
         if self.syncing:
+            self._set_visible(True)
             return
         mount = detect_ipod()
         if mount and self.connected_path != mount:
             log(f"iPod mounted at {mount}")
             self.connected_path = mount
             self.title = T_CONNECTED
+            self._set_visible(True)
             self._refresh_status()
             self._start_sync(mount)
         elif not mount and self.connected_path:
@@ -96,6 +118,10 @@ class Watcher(rumps.App):
             self.connected_path = None
             self.title = T_IDLE
             self._refresh_status()
+            self._set_visible(False)
+        else:
+            # No edge transition; reassert visibility to match current state.
+            self._set_visible(self.connected_path is not None)
 
     def _start_sync(self, mount: Path) -> None:
         self.syncing = True
