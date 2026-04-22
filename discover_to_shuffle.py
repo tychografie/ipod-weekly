@@ -15,6 +15,7 @@ files, and rebuilds the iTunesSD database via nims11/IPod-Shuffle-4g.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -634,6 +635,45 @@ def run_smart_sync(force: bool, reset: bool) -> None:
     print(f'\nDone. Eject with:\n  diskutil eject "{IPOD_MOUNT}"')
 
 
+def run_check() -> None:
+    """Report playlist change status to stdout as JSON. No side effects.
+
+    Shape:
+        {
+          "dw": {"name": "...", "changed": bool, "snapshot": "...",
+                 "prev_snapshot": "...", "track_count": N, "synced_at": "..."},
+          "rr": { ... }
+        }
+
+    fetch_playlist() prints progress lines to stdout; we redirect those to
+    stderr so the only thing on stdout is the JSON document (the watcher
+    parses it directly).
+    """
+    state = load_state()
+    result: dict = {}
+    for tag, cfg in PLAYLISTS.items():
+        with contextlib.redirect_stdout(sys.stderr):
+            tracks = fetch_playlist(cfg["url"])
+        if not tracks:
+            result[tag] = {
+                "name": cfg["name"],
+                "changed": False,
+                "error": "playlist returned no tracks",
+            }
+            continue
+        snapshot = compute_snapshot(tracks)
+        prev = state.get(tag, {})
+        result[tag] = {
+            "name": cfg["name"],
+            "changed": prev.get("snapshot") != snapshot,
+            "snapshot": snapshot,
+            "prev_snapshot": prev.get("snapshot"),
+            "track_count": len(tracks),
+            "synced_at": prev.get("synced_at"),
+        }
+    print(json.dumps(result))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -666,11 +706,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="(Smart mode) full wipe before syncing (also clears untagged legacy files).",
     )
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="Check-only: emit JSON describing which known playlists changed. No writes.",
+    )
     return p.parse_args()
 
 
 def main() -> "None":
     args = parse_args()
+    if args.check:
+        if args.url or args.add or args.force or args.reset:
+            die("--check is standalone; combine with no other flags.")
+        run_check()
+        return
     check_environment()
     if args.url:
         if args.force or args.reset:

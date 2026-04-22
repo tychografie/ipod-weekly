@@ -2,10 +2,19 @@
 """
 iPod Shuffle menubar watcher.
 
-Lives in the macOS status bar. Polls /Volumes/ for an iPod Shuffle mount;
-when one appears, runs discover_to_shuffle.py (smart mode) in the
-background and reports result via the menubar title + a native
-notification. Meant to be launched by a LaunchAgent at login.
+Lives in the macOS status bar. Polls /Volumes/ for a Shuffle mount; when
+one appears, runs `discover_to_shuffle.py --check` to see whether Spotify
+has rotated any known playlist (DW/RR). If so, asks the user whether to
+sync; otherwise stays silent. Meant to be launched by a LaunchAgent at
+login.
+
+Menu:
+    • Sync now
+    • Unmount iPod
+Hold Option while the menu is open for:
+    • Show state file
+    • Open log
+    • Quit watcher
 """
 from __future__ import annotations
 
@@ -16,7 +25,11 @@ from datetime import datetime
 from pathlib import Path
 
 import rumps
-from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSEventModifierFlagOption,
+)
 
 HERE = Path(__file__).resolve().parent
 SYNC_SCRIPT = HERE / "discover_to_shuffle.py"
@@ -25,12 +38,14 @@ STATE_FILE = Path.home() / ".ipod-weekly-state.json"
 LOG_FILE = HERE / ".watcher.log"
 
 POLL_INTERVAL = 3
+CHECK_TIMEOUT = 10 * 60
 SYNC_TIMEOUT = 30 * 60
 
-T_IDLE = "iPod 💤"
-T_CONNECTED = "iPod ▶"
-T_SYNCING = "iPod ⟳"
+T_CONNECTED = "iPod ✓"
+T_CHECKING = "iPod ⋯"
+T_SYNCING = "iPod ↻"
 T_ERROR = "iPod ⚠"
+T_IDLE = "iPod"  # only briefly visible before we hide
 
 
 def log(msg: str) -> None:
@@ -55,43 +70,60 @@ def detect_ipod() -> "Path | None":
     return None
 
 
+def _make_alt(item: rumps.MenuItem) -> rumps.MenuItem:
+    """Mark a MenuItem as the Option-held alternate of its predecessor.
+
+    NSMenuItem pairs an alternate with the item immediately above it: both
+    share a slot, and the alternate is shown instead when Option is held.
+    """
+    ns = item._menuitem
+    ns.setAlternate_(True)
+    ns.setKeyEquivalentModifierMask_(NSEventModifierFlagOption)
+    return item
+
+
 class Watcher(rumps.App):
     def __init__(self) -> None:
         super().__init__("iPod Weekly", title=T_IDLE, quit_button=None)
-        # Menubar-only: keep the python process out of the Dock / Cmd-Tab.
-        # NSApplicationActivationPolicyAccessory (=1) means "agent app with
-        # UI (status item), no Dock presence". Must be set after rumps has
-        # created the NSApplication.
+        # Menubar-only: stay out of the Dock / Cmd-Tab.
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
+
         self.status_item = rumps.MenuItem("Waiting for iPod…")
         self.menu = [
             self.status_item,
             None,
+            # Paired items: the alternate appears in place of the primary
+            # when the user holds Option while the menu is open.
             rumps.MenuItem("Sync now", callback=self.on_sync_now),
-            rumps.MenuItem("Show state file", callback=self.on_show_state),
-            rumps.MenuItem("Open log", callback=self.on_open_log),
-            None,
-            rumps.MenuItem("Quit", callback=self.on_quit),
+            _make_alt(rumps.MenuItem("Show state file", callback=self.on_show_state)),
+            rumps.MenuItem("Unmount iPod", callback=self.on_unmount),
+            _make_alt(rumps.MenuItem("Open log", callback=self.on_open_log)),
+            # Dummy primary so Quit has a slot to pair into. An empty
+            # NSMenuItem marked hidden takes up no visual space, and its
+            # alternate shows up when Option is held.
+            _make_hidden_spacer(),
+            _make_alt(rumps.MenuItem("Quit watcher", callback=self.on_quit)),
         ]
+
         self.connected_path: "Path | None" = None
+        self.checking = False
         self.syncing = False
-        self._refresh_status()
+        self._pending_result: "dict | None" = None
+
+        self._set_status("Waiting for iPod…")
         log("watcher started")
 
-        # Hide the menubar item on launch -- it should only appear while an
-        # iPod is mounted (or a sync is in flight). The NSStatusItem isn't
-        # created until rumps finishes launching the NSApplication, so we
-        # defer to a one-shot timer that fires shortly after the event loop
-        # is up.
+        # Hide the menubar item on launch; first poll will reveal it if an
+        # iPod is already mounted. NSStatusItem isn't attached yet in
+        # __init__, so we defer to a one-shot timer.
         self._init_timer = rumps.Timer(self._initial_setup, 0.15)
         self._init_timer.start()
 
     def _initial_setup(self, timer) -> None:
         timer.stop()
         self._set_visible(False)
-        # Immediate first poll so plugged-in iPods don't wait for the 3s tick.
         self._poll(None)
 
     def _set_visible(self, visible: bool) -> None:
@@ -100,56 +132,165 @@ class Watcher(rumps.App):
         except Exception as e:
             log(f"setVisible({visible}) failed: {e!r}")
 
-    def _refresh_status(self) -> None:
-        if self.syncing:
-            self.status_item.title = "Syncing…"
-        elif self.connected_path:
-            self.status_item.title = f"iPod mounted: {self.connected_path.name}"
-        else:
-            self.status_item.title = "Waiting for iPod…"
+    def _set_status(self, status: str, title: "str | None" = None) -> None:
+        if title is not None:
+            self.title = title
+        self.status_item.title = status
+
+    # -------- polling + state machine --------
 
     @rumps.timer(POLL_INTERVAL)
     def _poll(self, _sender) -> None:
-        if self.syncing:
+        # Drain any worker-thread result on the main thread first.
+        if self._pending_result is not None:
+            pending = self._pending_result
+            self._pending_result = None
+            self._handle_pending(pending)
+            return
+
+        # Don't mutate connection state while a subprocess is in flight.
+        if self.checking or self.syncing:
             self._set_visible(True)
             return
+
         mount = detect_ipod()
         if mount and self.connected_path != mount:
             log(f"iPod mounted at {mount}")
             self.connected_path = mount
-            self.title = T_CONNECTED
-            self._set_visible(True)
-            self._refresh_status()
-            self._start_sync(mount)
+            self._start_check(mount)
         elif not mount and self.connected_path:
             log(f"iPod ejected from {self.connected_path}")
             self.connected_path = None
-            self.title = T_IDLE
-            self._refresh_status()
+            self._set_status("Waiting for iPod…", title=T_IDLE)
             self._set_visible(False)
         else:
-            # No edge transition; reassert visibility to match current state.
             self._set_visible(self.connected_path is not None)
 
-    def _start_sync(self, mount: Path) -> None:
-        self.syncing = True
-        self.title = T_SYNCING
-        self._refresh_status()
-        threading.Thread(target=self._run_sync, args=(mount,), daemon=True).start()
+    # -------- check phase --------
 
-    def _run_sync(self, mount: Path) -> None:
+    def _start_check(self, mount: Path) -> None:
+        self.checking = True
+        self._set_status("Checking for new tracks…", title=T_CHECKING)
+        self._set_visible(True)
+        threading.Thread(target=self._check_thread, args=(mount,), daemon=True).start()
+
+    def _check_thread(self, mount: Path) -> None:
         try:
-            log(f"sync start ({mount})")
-            # LaunchAgents get a minimal env -- bake in a sane PATH so yt-dlp
-            # can find ffmpeg, and forward IPOD_MOUNT so the sync script skips
-            # its auto-detect (in case of multiple mounts).
+            log(f"check start ({mount})")
             env = {
                 "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                 "HOME": str(Path.home()),
-                "IPOD_MOUNT": str(mount),
                 "LANG": "en_US.UTF-8",
             }
-            result = subprocess.run(
+            proc = subprocess.run(
+                [str(VENV_PY), str(SYNC_SCRIPT), "--check"],
+                cwd=str(HERE),
+                capture_output=True,
+                text=True,
+                timeout=CHECK_TIMEOUT,
+                env=env,
+            )
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+                self._pending_result = {
+                    "kind": "check",
+                    "ok": False,
+                    "error": "\n".join(tail) or f"exit {proc.returncode}",
+                    "mount": mount,
+                }
+            else:
+                try:
+                    data = json.loads(proc.stdout)
+                    self._pending_result = {
+                        "kind": "check",
+                        "ok": True,
+                        "data": data,
+                        "mount": mount,
+                    }
+                except json.JSONDecodeError as e:
+                    self._pending_result = {
+                        "kind": "check",
+                        "ok": False,
+                        "error": f"bad JSON from --check: {e}",
+                        "mount": mount,
+                    }
+        except subprocess.TimeoutExpired:
+            self._pending_result = {
+                "kind": "check",
+                "ok": False,
+                "error": f"check timed out after {CHECK_TIMEOUT // 60} min",
+                "mount": mount,
+            }
+        except Exception as e:
+            self._pending_result = {"kind": "check", "ok": False, "error": str(e), "mount": mount}
+        finally:
+            self.checking = False
+            log("check done")
+
+    def _handle_check_result(self, pending: dict) -> None:
+        # If the iPod was ejected during the check, drop the result.
+        if self.connected_path is None:
+            log("check result arrived after eject; discarding")
+            return
+
+        if not pending["ok"]:
+            err = pending.get("error", "")
+            log(f"check failed: {err}")
+            self._set_status("Check failed", title=T_ERROR)
+            self._notify("Check failed", err)
+            return
+
+        data: dict = pending["data"]
+        changed = [p for p in data.values() if p.get("changed")]
+        if not changed:
+            log("check: up to date")
+            self._set_status("Up to date", title=T_CONNECTED)
+            # Silent: no notification when there's nothing to do.
+            return
+
+        # Prompt before doing any work. rumps.alert runs on the main thread
+        # (we're on the timer tick here), so it blocks until the user acts.
+        lines = ["Spotify has new tracks for:"]
+        for p in changed:
+            lines.append(f"  • {p['name']} ({p['track_count']} tracks)")
+        lines.append("")
+        lines.append(f"Sync to {self.connected_path.name}?")
+        self._set_status("Waiting for approval…", title=T_CHECKING)
+        response = rumps.alert(
+            title="iPod Weekly",
+            message="\n".join(lines),
+            ok="Sync",
+            cancel="Not now",
+        )
+        # Re-check connection: user may have ejected during the dialog.
+        if self.connected_path is None:
+            log("iPod ejected while dialog was open; not syncing")
+            return
+        if response == 1:
+            log("user approved sync")
+            self._start_sync(self.connected_path)
+        else:
+            log("user declined sync")
+            self._set_status("Sync skipped — will ask again on next connect", title=T_CONNECTED)
+
+    # -------- sync phase --------
+
+    def _start_sync(self, mount: Path) -> None:
+        self.syncing = True
+        self._set_status("Syncing…", title=T_SYNCING)
+        self._set_visible(True)
+        threading.Thread(target=self._sync_thread, args=(mount,), daemon=True).start()
+
+    def _sync_thread(self, mount: Path) -> None:
+        try:
+            log(f"sync start ({mount})")
+            env = {
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                "HOME": str(Path.home()),
+                "LANG": "en_US.UTF-8",
+                "IPOD_MOUNT": str(mount),
+            }
+            proc = subprocess.run(
                 [str(VENV_PY), str(SYNC_SCRIPT)],
                 cwd=str(HERE),
                 capture_output=True,
@@ -157,26 +298,47 @@ class Watcher(rumps.App):
                 timeout=SYNC_TIMEOUT,
                 env=env,
             )
-            if result.returncode == 0:
-                log("sync ok")
-                self.title = T_CONNECTED
-                self._notify("Sync complete", self._summarize(result.stdout))
+            if proc.returncode == 0:
+                self._pending_result = {
+                    "kind": "sync",
+                    "ok": True,
+                    "summary": self._summarize(proc.stdout),
+                }
             else:
-                log(f"sync failed exit={result.returncode}")
-                self.title = T_ERROR
-                tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
-                self._notify("Sync failed", "\n".join(tail) or f"exit {result.returncode}")
+                tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+                self._pending_result = {
+                    "kind": "sync",
+                    "ok": False,
+                    "error": "\n".join(tail) or f"exit {proc.returncode}",
+                }
         except subprocess.TimeoutExpired:
-            log("sync timeout")
-            self.title = T_ERROR
-            self._notify("Sync timed out", f"> {SYNC_TIMEOUT // 60} minutes")
+            self._pending_result = {
+                "kind": "sync",
+                "ok": False,
+                "error": f"sync timed out after {SYNC_TIMEOUT // 60} min",
+            }
         except Exception as e:
-            log(f"sync crashed: {e!r}")
-            self.title = T_ERROR
-            self._notify("Sync crashed", str(e))
+            self._pending_result = {"kind": "sync", "ok": False, "error": str(e)}
         finally:
             self.syncing = False
-            self._refresh_status()
+            log("sync done")
+
+    def _handle_sync_result(self, pending: dict) -> None:
+        if pending["ok"]:
+            self._set_status("Sync complete", title=T_CONNECTED)
+            self._notify("Sync complete", pending["summary"])
+        else:
+            self._set_status("Sync failed", title=T_ERROR)
+            self._notify("Sync failed", pending["error"])
+
+    def _handle_pending(self, pending: dict) -> None:
+        kind = pending.get("kind")
+        if kind == "check":
+            self._handle_check_result(pending)
+        elif kind == "sync":
+            self._handle_sync_result(pending)
+
+    # -------- helpers --------
 
     @staticmethod
     def _summarize(stdout: str) -> str:
@@ -192,8 +354,6 @@ class Watcher(rumps.App):
         return "\n".join(picked[:3]) if picked else "Sync complete"
 
     def _notify(self, subtitle: str, message: str) -> None:
-        # rumps.notification wants the app to be a bundled .app to deliver
-        # reliably; fall back to osascript which works from plain scripts too.
         try:
             rumps.notification("iPod Weekly", subtitle, message)
             return
@@ -214,16 +374,43 @@ class Watcher(rumps.App):
         except Exception as e:
             log(f"osascript notify failed: {e!r}")
 
+    # -------- menu callbacks --------
+
     def on_sync_now(self, _sender) -> None:
-        if self.syncing:
-            self._notify("Busy", "Sync already in progress")
+        if self.checking or self.syncing:
+            self._notify("Busy", "A check or sync is already in progress")
             return
         mount = self.connected_path or detect_ipod()
         if not mount:
             self._notify("No iPod", "Nothing mounted under /Volumes/ with iPod_Control/")
             return
         self.connected_path = mount
-        self._start_sync(mount)
+        self._start_check(mount)
+
+    def on_unmount(self, _sender) -> None:
+        mount = self.connected_path or detect_ipod()
+        if not mount:
+            self._notify("No iPod", "Nothing to unmount")
+            return
+        if self.checking or self.syncing:
+            self._notify("Busy", "Wait for the current operation to finish before unmounting")
+            return
+        log(f"unmount requested for {mount}")
+        try:
+            proc = subprocess.run(
+                ["diskutil", "eject", str(mount)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode == 0:
+                # Next _poll will notice the absence and hide the menubar.
+                self._set_status("Unmounted — safe to unplug", title=T_CONNECTED)
+                self._notify("Unmounted", "Safe to unplug the iPod")
+            else:
+                self._notify("Unmount failed", (proc.stderr or proc.stdout).strip())
+        except Exception as e:
+            self._notify("Unmount failed", str(e))
 
     def on_show_state(self, _sender) -> None:
         if STATE_FILE.exists():
@@ -243,6 +430,13 @@ class Watcher(rumps.App):
     def on_quit(self, _sender) -> None:
         log("quit requested")
         rumps.quit_application()
+
+
+def _make_hidden_spacer() -> rumps.MenuItem:
+    """Invisible primary item to pair with a trailing Option-only alternate."""
+    item = rumps.MenuItem(" ")
+    item._menuitem.setHidden_(True)
+    return item
 
 
 if __name__ == "__main__":
