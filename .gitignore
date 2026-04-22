@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Upstream clone -- users run `git clone https://github.com/nims11/IPod-Shuffle-4g.git`
+# per the README; no need to vendor it.
+IPod-Shuffle-4g/
+
+# Temp dir where yt-dlp drops MP3s before they're copied to the iPod.
+discover-weekly-tmp/
