@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import rumps
+from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
 HERE = Path(__file__).resolve().parent
 SYNC_SCRIPT = HERE / "discover_to_shuffle.py"
@@ -57,6 +58,13 @@ def detect_ipod() -> "Path | None":
 class Watcher(rumps.App):
     def __init__(self) -> None:
         super().__init__("iPod Weekly", title=T_IDLE, quit_button=None)
+        # Menubar-only: keep the python process out of the Dock / Cmd-Tab.
+        # NSApplicationActivationPolicyAccessory (=1) means "agent app with
+        # UI (status item), no Dock presence". Must be set after rumps has
+        # created the NSApplication.
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
         self.status_item = rumps.MenuItem("Waiting for iPod…")
         self.menu = [
             self.status_item,
