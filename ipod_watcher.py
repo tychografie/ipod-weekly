@@ -19,6 +19,7 @@ Hold Option while the menu is open for:
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import threading
 from datetime import datetime
@@ -41,11 +42,11 @@ POLL_INTERVAL = 3
 CHECK_TIMEOUT = 10 * 60
 SYNC_TIMEOUT = 30 * 60
 
-T_CONNECTED = "iPod ✓"
-T_CHECKING = "iPod ⋯"
-T_SYNCING = "iPod ↻"
-T_ERROR = "iPod ⚠"
-T_IDLE = "iPod"  # only briefly visible before we hide
+S_CONNECTED = "✓"
+S_CHECKING = "⋯"
+S_SYNCING = "↻"
+S_ERROR = "⚠"
+DEFAULT_MODEL = "iPod"
 
 
 def log(msg: str) -> None:
@@ -70,6 +71,67 @@ def detect_ipod() -> "Path | None":
     return None
 
 
+def _walk_plist(node):
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk_plist(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk_plist(v)
+
+
+def get_ipod_model() -> "str | None":
+    """Query USB metadata for the attached iPod's marketing name.
+
+    Example returns: "iPod shuffle", "iPod nano", "iPod". Returns None if
+    system_profiler doesn't find a device that looks like an iPod.
+    """
+    try:
+        proc = subprocess.run(
+            ["system_profiler", "-json", "SPUSBDataType"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+    except Exception as e:
+        log(f"system_profiler failed: {e!r}")
+        return None
+    for node in _walk_plist(data):
+        name = node.get("_name", "") if isinstance(node, dict) else ""
+        if name and "ipod" in name.lower():
+            return name
+    return None
+
+
+def format_capacity(mount: Path) -> str:
+    try:
+        usage = shutil.disk_usage(str(mount))
+    except Exception as e:
+        log(f"disk_usage({mount}) failed: {e!r}")
+        return ""
+    used = usage.used
+    total = usage.total
+    gb = 1024 * 1024 * 1024
+    mb = 1024 * 1024
+    used_s = f"{used / mb:.0f} MB" if used < gb else f"{used / gb:.1f} GB"
+    total_s = f"{total / gb:.1f} GB"
+    return f"{used_s} / {total_s}"
+
+
+def count_songs(mount: Path) -> int:
+    music = mount / "iPod_Control" / "Music"
+    if not music.exists():
+        return 0
+    try:
+        return sum(1 for _ in music.rglob("*.mp3"))
+    except OSError:
+        return 0
+
+
 def _make_alt(item: rumps.MenuItem) -> rumps.MenuItem:
     """Mark a MenuItem as the Option-held alternate of its predecessor.
 
@@ -84,15 +146,20 @@ def _make_alt(item: rumps.MenuItem) -> rumps.MenuItem:
 
 class Watcher(rumps.App):
     def __init__(self) -> None:
-        super().__init__("iPod Weekly", title=T_IDLE, quit_button=None)
+        super().__init__("iPod Weekly", title=DEFAULT_MODEL, quit_button=None)
         # Menubar-only: stay out of the Dock / Cmd-Tab.
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
 
         self.status_item = rumps.MenuItem("Waiting for iPod…")
+        # Option-held replacement for status_item: shows capacity + song count.
+        self.capacity_item = rumps.MenuItem("—")
+        _make_alt(self.capacity_item)
+
         self.menu = [
             self.status_item,
+            self.capacity_item,
             None,
             # Paired items: the alternate appears in place of the primary
             # when the user holds Option while the menu is open.
@@ -108,6 +175,7 @@ class Watcher(rumps.App):
         ]
 
         self.connected_path: "Path | None" = None
+        self.model: str = DEFAULT_MODEL
         self.checking = False
         self.syncing = False
         self._pending_result: "dict | None" = None
@@ -132,10 +200,28 @@ class Watcher(rumps.App):
         except Exception as e:
             log(f"setVisible({visible}) failed: {e!r}")
 
-    def _set_status(self, status: str, title: "str | None" = None) -> None:
-        if title is not None:
-            self.title = title
+    def _title_for(self, suffix: str = "") -> str:
+        base = self.model or DEFAULT_MODEL
+        return f"{base} {suffix}".rstrip()
+
+    def _set_status(self, status: str, suffix: "str | None" = None) -> None:
+        if suffix is not None:
+            self.title = self._title_for(suffix)
         self.status_item.title = status
+
+    def _refresh_capacity_line(self) -> None:
+        """Update the Option-held 'capacity' line based on current mount."""
+        mount = self.connected_path
+        if mount is None or not mount.exists():
+            self.capacity_item.title = "—"
+            return
+        cap = format_capacity(mount)
+        songs = count_songs(mount)
+        song_word = "song" if songs == 1 else "songs"
+        parts = [f"{songs} {song_word}"]
+        if cap:
+            parts.append(cap)
+        self.capacity_item.title = " • ".join(parts)
 
     # -------- polling + state machine --------
 
@@ -157,20 +243,29 @@ class Watcher(rumps.App):
         if mount and self.connected_path != mount:
             log(f"iPod mounted at {mount}")
             self.connected_path = mount
+            self.model = get_ipod_model() or DEFAULT_MODEL
+            log(f"detected model: {self.model!r}")
+            self._refresh_capacity_line()
             self._start_check(mount)
         elif not mount and self.connected_path:
             log(f"iPod ejected from {self.connected_path}")
             self.connected_path = None
-            self._set_status("Waiting for iPod…", title=T_IDLE)
+            self.model = DEFAULT_MODEL
+            self._refresh_capacity_line()
+            self._set_status("Waiting for iPod…", suffix="")
             self._set_visible(False)
         else:
+            # Keep the capacity line fresh while idle + connected (it can
+            # change if something else writes to the volume).
+            if self.connected_path is not None:
+                self._refresh_capacity_line()
             self._set_visible(self.connected_path is not None)
 
     # -------- check phase --------
 
     def _start_check(self, mount: Path) -> None:
         self.checking = True
-        self._set_status("Checking for new tracks…", title=T_CHECKING)
+        self._set_status("Checking for new tracks…", suffix=S_CHECKING)
         self._set_visible(True)
         threading.Thread(target=self._check_thread, args=(mount,), daemon=True).start()
 
@@ -236,7 +331,7 @@ class Watcher(rumps.App):
         if not pending["ok"]:
             err = pending.get("error", "")
             log(f"check failed: {err}")
-            self._set_status("Check failed", title=T_ERROR)
+            self._set_status("Check failed", suffix=S_ERROR)
             self._notify("Check failed", err)
             return
 
@@ -244,7 +339,7 @@ class Watcher(rumps.App):
         changed = [p for p in data.values() if p.get("changed")]
         if not changed:
             log("check: up to date")
-            self._set_status("Up to date", title=T_CONNECTED)
+            self._set_status("Up to date", suffix=S_CONNECTED)
             # Silent: no notification when there's nothing to do.
             return
 
@@ -255,9 +350,9 @@ class Watcher(rumps.App):
             lines.append(f"  • {p['name']} ({p['track_count']} tracks)")
         lines.append("")
         lines.append(f"Sync to {self.connected_path.name}?")
-        self._set_status("Waiting for approval…", title=T_CHECKING)
+        self._set_status("Waiting for approval…", suffix=S_CHECKING)
         response = rumps.alert(
-            title="iPod Weekly",
+            title=self.model or DEFAULT_MODEL,
             message="\n".join(lines),
             ok="Sync",
             cancel="Not now",
@@ -271,13 +366,16 @@ class Watcher(rumps.App):
             self._start_sync(self.connected_path)
         else:
             log("user declined sync")
-            self._set_status("Sync skipped — will ask again on next connect", title=T_CONNECTED)
+            self._set_status(
+                "Sync skipped — will ask again on next connect",
+                suffix=S_CONNECTED,
+            )
 
     # -------- sync phase --------
 
     def _start_sync(self, mount: Path) -> None:
         self.syncing = True
-        self._set_status("Syncing…", title=T_SYNCING)
+        self._set_status("Syncing…", suffix=S_SYNCING)
         self._set_visible(True)
         threading.Thread(target=self._sync_thread, args=(mount,), daemon=True).start()
 
@@ -324,11 +422,13 @@ class Watcher(rumps.App):
             log("sync done")
 
     def _handle_sync_result(self, pending: dict) -> None:
+        # Capacity / song count changed after a successful sync.
+        self._refresh_capacity_line()
         if pending["ok"]:
-            self._set_status("Sync complete", title=T_CONNECTED)
+            self._set_status("Sync complete", suffix=S_CONNECTED)
             self._notify("Sync complete", pending["summary"])
         else:
-            self._set_status("Sync failed", title=T_ERROR)
+            self._set_status("Sync failed", suffix=S_ERROR)
             self._notify("Sync failed", pending["error"])
 
     def _handle_pending(self, pending: dict) -> None:
@@ -405,7 +505,7 @@ class Watcher(rumps.App):
             )
             if proc.returncode == 0:
                 # Next _poll will notice the absence and hide the menubar.
-                self._set_status("Unmounted — safe to unplug", title=T_CONNECTED)
+                self._set_status("Unmounted — safe to unplug", suffix=S_CONNECTED)
                 self._notify("Unmounted", "Safe to unplug the iPod")
             else:
                 self._notify("Unmount failed", (proc.stderr or proc.stdout).strip())
