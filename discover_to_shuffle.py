@@ -23,29 +23,65 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Config -- edit these if your setup differs
 # ---------------------------------------------------------------------------
-PLAYLIST_URL = "https://open.spotify.com/playlist/37i9dQZEVXcIbA23Oqj31h"
 
-# Smart-mode playlists. Tag is used as a filename prefix (dw_*.mp3, rr_*.mp3)
-# so selective wipes can target exactly one playlist's tracks on the iPod.
-PLAYLISTS = {
-    "dw": {"name": "Discover Weekly", "url": PLAYLIST_URL},
+# Smart-mode sources. Tag is used as a filename prefix (dw_*.mp3, rr_*.mp3)
+# so selective wipes can target exactly one source's tracks on the iPod.
+# Each entry is a Spotify playlist or album URL; the type is inferred from
+# the URL path (/playlist/ vs /album/) -- no manual classification needed.
+# Defaults used when no user config exists yet.
+DEFAULT_PLAYLISTS = {
+    "dw": {
+        "name": "Discover Weekly",
+        "url": "https://open.spotify.com/playlist/37i9dQZEVXcIbA23Oqj31h",
+    },
     "rr": {
         "name": "Release Radar",
         "url": "https://open.spotify.com/playlist/37i9dQZEVXbqd1Ig0YN47j",
     },
 }
 
+
+def detect_source_type(url: str) -> str:
+    """Return 'playlist' or 'album' from a Spotify URL. Defaults to playlist."""
+    if "/album/" in url:
+        return "album"
+    return "playlist"
+
+# User-editable playlist config. Written by the menubar watcher when the
+# user adds / edits / removes a source; missing or malformed → defaults.
+CONFIG_FILE = Path.home() / ".ipod-weekly-config.json"
+
 # Per-playlist snapshot hashes live here. A snapshot changes iff Spotify
 # rotated the playlist (different ordered set of track URIs / names).
 STATE_FILE = Path.home() / ".ipod-weekly-state.json"
+
+
+def load_playlists() -> "dict[str, dict]":
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text())
+            pls = data.get("playlists")
+            if isinstance(pls, dict) and pls:
+                return pls
+        except (OSError, json.JSONDecodeError) as e:
+            print(
+                f"warning: could not read {CONFIG_FILE} ({e}); using defaults",
+                file=sys.stderr,
+            )
+    return dict(DEFAULT_PLAYLISTS)
+
+
+PLAYLISTS = load_playlists()
 
 # We used to hardcode "/Volumes/IPOD SHUFFL" but the FAT32 volume label is
 # fragile -- after firmware resets or reformat recoveries it comes back as
@@ -80,6 +116,15 @@ IPOD_MOUNT = _detect_ipod_mount()
 TMP_DIR = Path.home() / "discover-weekly-tmp"
 IPOD_SHUFFLE_SCRIPT = Path(__file__).resolve().parent / "IPod-Shuffle-4g" / "ipod-shuffle-4g.py"
 AUDIO_QUALITY = "5"  # yt-dlp VBR scale: 0 best, 9 worst; 5 ~ 130 kbps VBR
+# Parallel yt-dlp workers. 4 keeps wall time ~4x faster than serial without
+# tripping YouTube's per-IP rate limiter; going higher gets diminishing
+# returns and occasional throttling.
+DOWNLOAD_WORKERS = 4
+# Hard wall per yt-dlp invocation. Real downloads finish in ~10-30s; anything
+# past 2 min is almost always a search that won't resolve (we saw 5+ min
+# hangs on YouTube Music for tracks with diacritics / comma-joined artists).
+# Kill it and let the worker move to the next source / mark the track as miss.
+SOURCE_TIMEOUT = 120
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -162,7 +207,72 @@ def _extract_album_and_cover(inner: dict) -> "tuple[str, str]":
     return album, cover_url
 
 
-def fetch_playlist(url: str = PLAYLIST_URL) -> "list[dict]":
+def fetch_source(url: str) -> "list[dict]":
+    """Dispatch to fetch_playlist or fetch_album based on the URL."""
+    if detect_source_type(url) == "album":
+        return fetch_album(url)
+    return fetch_playlist(url)
+
+
+def fetch_album(url: str) -> "list[dict]":
+    """Return list of {title, artist, album, cover_url} dicts for a Spotify album.
+
+    Albums are uniform: one artist, one album name, one cover. So we don't need
+    the per-track enrichment HTTP fan-out that fetch_playlist does -- a single
+    get_album_info call gives us everything.
+    """
+    try:
+        from spotify_scraper import SpotifyClient  # type: ignore
+    except ImportError:
+        try:
+            from spotifyscraper import SpotifyClient  # type: ignore
+        except ImportError:
+            die("spotifyscraper not installed. Run: pip install spotifyscraper")
+
+    client = SpotifyClient()
+    try:
+        data = client.get_album_info(url)
+    except Exception as e:
+        die(f"Failed to scrape album: {e}")
+
+    album_name = _clean(data.get("name") or "") or "Unknown Album"
+
+    artists_raw = data.get("artists") or []
+    if artists_raw and isinstance(artists_raw[0], dict):
+        names = [_clean(a.get("name", "")) for a in artists_raw if a.get("name")]
+        album_artist = ", ".join(n for n in names if n)
+    else:
+        album_artist = ", ".join(_clean(str(a)) for a in artists_raw)
+    album_artist = album_artist or "Unknown Artist"
+
+    images = data.get("images") or []
+    cover_url = ""
+    if images and isinstance(images[0], dict):
+        cover_url = images[0].get("url", "")
+    elif images:
+        cover_url = str(images[0])
+
+    raw_tracks = data.get("tracks") or []
+    tracks: "list[dict]" = []
+    for t in raw_tracks:
+        if not isinstance(t, dict):
+            continue
+        name = _clean(t.get("name") or t.get("title") or "")
+        if not name:
+            continue
+        tracks.append(
+            {
+                "title": name,
+                "artist": album_artist,
+                "album": album_name,
+                "cover_url": cover_url,
+                "uri": t.get("uri") or t.get("id") or "",
+            }
+        )
+    return tracks
+
+
+def fetch_playlist(url: str) -> "list[dict]":
     """Return list of {title, artist, album, cover_url} dicts.
 
     SpotifyScraper's get_playlist_info returns only name+artists per track --
@@ -232,6 +342,7 @@ def fetch_playlist(url: str = PLAYLIST_URL) -> "list[dict]":
                 "artist": (artist or "Unknown Artist").strip(),
                 "album": (album or playlist_name).strip(),
                 "cover_url": cover_url or playlist_cover,
+                "uri": uri,
             }
         )
 
@@ -242,7 +353,18 @@ def fetch_playlist(url: str = PLAYLIST_URL) -> "list[dict]":
 # 2. Download with fallback chain
 # ---------------------------------------------------------------------------
 
-def download_track(track: dict, index: int, out_dir: Path, tag: str = "") -> "Path | None":
+def download_track(
+    track: dict, index: int, out_dir: Path, tag: str = ""
+) -> "tuple[Path, str] | None":
+    """Try YouTube → SoundCloud → YouTube Music until one yields an MP3.
+
+    Each source attempt is bounded by SOURCE_TIMEOUT so a stalled search
+    can't hang the worker indefinitely. Returns (path, source_label) on the
+    first success, or None if every source missed.
+
+    Silent on purpose: download_all funnels per-track results through a lock
+    so concurrent workers don't interleave their progress lines into soup.
+    """
     prefix = f"{tag}_" if tag else ""
     base = f"{prefix}{index:02d}_{sanitize(track['artist'])}_{sanitize(track['title'])}"
     out_template = str(out_dir / f"{base}.%(ext)s")
@@ -259,7 +381,6 @@ def download_track(track: dict, index: int, out_dir: Path, tag: str = "") -> "Pa
     ]
 
     for label, target in sources:
-        print(f"  -> {label}...", end=" ", flush=True)
         cmd = [
             sys.executable, "-m", "yt_dlp",
             target,
@@ -276,19 +397,23 @@ def download_track(track: dict, index: int, out_dir: Path, tag: str = "") -> "Pa
             "-o", out_template,
         ]
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            print("miss")
+            subprocess.run(
+                cmd,
+                check=True,
+                timeout=SOURCE_TIMEOUT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # On TimeoutExpired the child has already been killed by run().
             continue
 
         if expected.exists():
-            print(f"ok ({human_mb(expected.stat().st_size)})")
-            return expected
+            return expected, label
         # yt-dlp sometimes writes a different extension if mp3 conversion failed
         for alt in out_dir.glob(f"{base}.*"):
             if alt.suffix != ".mp3":
                 alt.unlink(missing_ok=True)
-        print("miss")
 
     return None
 
@@ -455,14 +580,22 @@ def save_state(state: dict) -> None:
 
 
 def compute_snapshot(tracks: "list[dict]") -> str:
-    """Fingerprint of the playlist -- changes iff Spotify rotated the tracks.
+    """Fingerprint of the source -- changes iff Spotify rotated the tracks.
 
-    Hashing (artist, title) pairs in order. We don't have stable Spotify URIs
-    in the enriched output, so (artist, title) is the cheapest reliable proxy;
-    collisions require Spotify to replace a track with a different song that
-    happens to share artist *and* title -- vanishingly rare for DW/RR.
+    Prefer hashing the ordered list of Spotify track URIs (stable IDs that
+    don't drift). We saw real-world false positives when hashing (artist,
+    title) strings -- Spotify silently re-tags titles ("- Remix" gaining a
+    suffix, featured-artist ordering shifting) so the same playlist would
+    snapshot differently on consecutive fetches even with no rotation.
+
+    Fall back to (artist, title) only if URIs are missing for all tracks
+    (very old enriched outputs, or a backend that stops returning them).
     """
-    sig = "\n".join(f"{t['artist']}\t{t['title']}" for t in tracks)
+    uris = [(t.get("uri") or "").strip() for t in tracks]
+    if any(uris):
+        sig = "\n".join(uris)
+    else:
+        sig = "\n".join(f"{t['artist']}\t{t['title']}" for t in tracks)
     return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:16]
 
 
@@ -490,21 +623,70 @@ def now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 def download_all(tracks: "list[dict]", tag: str = "") -> "tuple[list[Path], list[dict]]":
-    """Download + tag every track. Returns (downloaded_mp3s, failed_tracks)."""
-    downloaded: "list[Path]" = []
-    failed: "list[dict]" = []
-    for i, track in enumerate(tracks, 1):
-        print(f"[{i:02d}/{len(tracks)}] {track['artist']} -- {track['title']}")
-        mp3 = download_track(track, i, TMP_DIR, tag=tag)
-        if mp3 is None:
-            failed.append(track)
-            continue
-        try:
-            tag_track(mp3, track)
-        except Exception as e:
-            print(f"  tagging failed ({e}); keeping file with yt-dlp tags")
-        downloaded.append(mp3)
-    return downloaded, failed
+    """Download + tag every track in parallel. Returns (downloaded, failed).
+
+    Workers run yt-dlp concurrently (network-bound, so the GIL isn't a real
+    cost). Output is serialized through a lock:
+      • a `[start ]` line when a worker picks up a track (so postmortem
+        diff of starts-vs-completions identifies stuck tracks),
+      • a `[N/total]` line on completion -- N is the monotonic completion
+        count that drives the menubar progress arc, and includes which
+        source produced the MP3 (YouTube / SoundCloud / YouTube Music).
+    """
+    total = len(tracks)
+    if total == 0:
+        return [], []
+
+    state: dict = {
+        "done": 0,
+        "downloaded": [],
+        "failed": [],
+    }
+    lock = threading.Lock()
+    label = tag or "pl"
+
+    def _job(index: int, track: dict) -> None:
+        with lock:
+            print(
+                f"[start  ] {label}#{index:02d}  "
+                f"{track['artist']} -- {track['title']}",
+                flush=True,
+            )
+        result = download_track(track, index, TMP_DIR, tag=tag)
+        tag_err = ""
+        if result is not None:
+            mp3, _source = result
+            try:
+                tag_track(mp3, track)
+            except Exception as e:
+                tag_err = str(e)
+        with lock:
+            state["done"] += 1
+            n = state["done"]
+            if result is not None:
+                mp3, source = result
+                size = human_mb(mp3.stat().st_size)
+                print(
+                    f"[{n:02d}/{total}] ok    {label}#{index:02d}  "
+                    f"{track['artist']} -- {track['title']}  ({source}, {size})",
+                    flush=True,
+                )
+                if tag_err:
+                    print(f"  tagging failed ({tag_err}); keeping yt-dlp tags", flush=True)
+                state["downloaded"].append(mp3)
+            else:
+                print(
+                    f"[{n:02d}/{total}] miss  {label}#{index:02d}  "
+                    f"{track['artist']} -- {track['title']}",
+                    flush=True,
+                )
+                state["failed"].append(track)
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as ex:
+        # list() forces the iterator so exceptions from workers propagate.
+        list(ex.map(_job, range(1, total + 1), tracks))
+
+    return state["downloaded"], state["failed"]
 
 
 def run_single_playlist(url: str, add: bool) -> None:
@@ -557,7 +739,7 @@ def run_smart_sync(force: bool, reset: bool) -> None:
     plans: "list[tuple[str, dict, list[dict], str, str | None]]" = []
     for tag, cfg in PLAYLISTS.items():
         print(f"\nChecking {cfg['name']}...")
-        tracks = fetch_playlist(cfg["url"])
+        tracks = fetch_source(cfg["url"])
         if not tracks:
             print(f"  no tracks returned; skipping {cfg['name']}")
             continue
@@ -653,7 +835,7 @@ def run_check() -> None:
     result: dict = {}
     for tag, cfg in PLAYLISTS.items():
         with contextlib.redirect_stdout(sys.stderr):
-            tracks = fetch_playlist(cfg["url"])
+            tracks = fetch_source(cfg["url"])
         if not tracks:
             result[tag] = {
                 "name": cfg["name"],
